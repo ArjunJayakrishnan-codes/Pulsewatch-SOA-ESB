@@ -21,19 +21,21 @@ Reproducibility notes:
   reports from scratch; `MODEL_EVALUATION.md` documents their
   methodology and limitations.
 
-## 1. Run the Next.js app (unchanged)
+## 1. Run the application stack
 
 ```bash
 npm install
 npx prisma generate
 npx prisma migrate dev
-npm run dev
+./start.sh
 ```
 
-PulseWatch's core watchlist/attention functionality works with **zero**
-Python dependency. If `NLP_FEATURE_ENABLED=false` or the NLP service
-isn't running, NLP panels show a quiet "unavailable" state instead of
-breaking anything (see `src/server/modules/nlp/client.ts`).
+The supported stack requires Java 17+ and starts the Python NLP service,
+Apache Camel ESB, and Next.js together. Next.js routes its NLP, market,
+news, RAG, and chat calls through Camel; starting Next.js alone is not a
+supported runtime topology. Core watchlist functionality remains available
+when an upstream feature is unavailable, with NLP surfaces showing an
+unavailable state rather than breaking unrelated pages.
 
 ## 2. Run the NLP service
 
@@ -47,10 +49,11 @@ uvicorn app.main:app --reload --port 8000
 
 Verify it's up: `curl http://localhost:8000/health` → `{"status":"ok",...}`.
 
-Set in your Next.js `.env`:
+The app must point at Camel, not directly at the Python service. Set in your
+Next.js `.env`:
 
 ```
-NLP_SERVICE_URL=http://localhost:8000
+NLP_SERVICE_URL=http://127.0.0.1:8081
 NLP_SERVICE_TIMEOUT_MS=8000
 NLP_FEATURE_ENABLED=true
 ```
@@ -113,32 +116,80 @@ Python `/rag/query` generation option also supports Groq; for that
 endpoint, set `GROQ_API_KEY` in the Python service's environment. Chat
 uses retrieval-only from Python and calls Groq from the Next.js server.
 
-## 5. Run both together
+## 5. Required: Apache Camel ESB
 
-After configuring `.env` and applying the Prisma migration, the repository
-root launcher can start both services in one terminal:
+Install Java 17+ and start the full project with:
 
 ```bash
 ./start.sh
 ```
 
-It creates the Python virtual environment and installs the service
-requirements on first use. Use `./start.sh --no-nlp` to start only Next.js.
-Alternatively, run the services manually in two terminals:
+The launcher starts the Python service on port 8000, Camel on port 8081,
+then Next.js on port 3000 with `NLP_SERVICE_URL` pointed at Camel. Camel's
+`/health` endpoint reports ESB liveness and `/ready` checks that the Python
+service is reachable through the gateway. Use `ESB_PORT` to choose a
+different gateway port; when overriding it, set `NLP_SERVICE_URL` to that
+same ESB address in the app environment.
 
-```bash
+For manual startup, use separate terminals.
+
+### Windows PowerShell
+
+```powershell
 # Terminal 1
-cd nlp-service && uvicorn app.main:app --reload --port 8000
+Set-Location .\nlp-service
+.\.venv\Scripts\python.exe -m uvicorn app.main:app --reload --port 8000
 
 # Terminal 2
+Set-Location .\esb
+$env:NLP_SERVICE_TARGET_URL = "http://127.0.0.1:8000"
+$env:ESB_PORT = "8081"
+.\mvnw.cmd spring-boot:run
+
+# Terminal 3 (from the repository root)
+$env:NLP_SERVICE_URL = "http://127.0.0.1:8081"
 npm run dev
 ```
 
-Visit `http://localhost:3000`, then open PulseWatch AI and ask about a symbol
-such as TCS to retrieve market data, news and NLP-backed evidence. Use
-`/nlp-demo` to paste arbitrary text through the full pipeline.
+### Bash
 
-## 6. Run the tests
+```bash
+# Terminal 1
+cd nlp-service
+uvicorn app.main:app --reload --port 8000
+
+# Terminal 2
+cd esb
+NLP_SERVICE_TARGET_URL=http://127.0.0.1:8000 ESB_PORT=8081 bash ./mvnw spring-boot:run
+
+# Terminal 3 (from the repository root)
+NLP_SERVICE_URL=http://127.0.0.1:8081 npm run dev
+```
+
+The Camel application can be tested independently with `bash ./mvnw test`
+from `esb/` (or `.\mvnw.cmd test` in Windows PowerShell). It proxies
+existing Python service paths and preserves HTTP status,
+body, content type, and query parameters; it does not take over user
+authentication, persistence, or application business rules. See
+`SOA_ARCHITECTURE.md` for the service map and rollout notes.
+
+## 6. Run the complete project
+
+After configuring `.env` and applying the Prisma migration, run the root
+launcher to start all three services in the required order:
+
+```bash
+./start.sh
+```
+
+On first use it creates the Python virtual environment and installs its
+requirements. For a manual start, run the three services in order using
+the commands in section 5; do not point Next.js directly at port 8000.
+
+Visit `http://localhost:3000`, then open PulseWatch AI and ask about a symbol
+such as TCS to retrieve market data, news and NLP-backed evidence.
+
+## 7. Run the tests
 
 ```bash
 # Python NLP service
@@ -152,7 +203,7 @@ npm run typecheck # tsc --noEmit
 npm run lint       # eslint
 ```
 
-## 7. Run the evaluation scripts
+## 8. Run the evaluation scripts
 
 ```bash
 cd nlp-service
@@ -167,7 +218,7 @@ MODEL_EVALUATION.md for the current output of both, with methodology
 notes (train/test split, no separate dev split and why, dataset-size
 caveats).
 
-## 8. Docker (optional)
+## 9. Docker (optional)
 
 ```bash
 cd nlp-service

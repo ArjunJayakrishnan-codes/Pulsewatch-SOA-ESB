@@ -21,6 +21,8 @@ happened to a stock, NLP tells you **why** it may have happened. See:
 - **NLP_SETUP.md** — how to install and run the Python NLP service
   alongside the existing Next.js app, including optional transformer
   models (FinBERT, spaCy, sentence-transformers).
+- **SOA_ARCHITECTURE.md** — service boundaries, API integration, and the
+  required Apache Camel ESB integration layer.
 - **DATASET_SETUP.md** — where to place the Financial PhraseBank and a
   real financial news corpus.
 - **DATASETS.md** — provenance and remaining sample datasets; they are
@@ -28,14 +30,12 @@ happened to a stock, NLP tells you **why** it may have happened. See:
 - **MODEL_EVALUATION.md** — real, measured classical-vs-transformer
   metrics (never fabricated numbers).
 
-New surfaces: the unified PulseWatch AI chat, which combines market data,
-live news retrieval, sentiment/topic/event analysis and evidence citations,
-and a `/nlp-demo` page for pasting arbitrary text through the full pipeline.
-All existing
-PulseWatch functionality (watchlists, market data, the price-based
-attention engine, auth) is unchanged and works with zero Python
-dependency if the NLP service isn't running (`NLP_FEATURE_ENABLED=false`
-or the service is simply down) — see NLP_SETUP.md.
+New surface: the unified PulseWatch AI chat, which combines market data,
+live news retrieval, sentiment/topic/event analysis and evidence citations.
+All existing PulseWatch functionality (watchlists, market data, the
+price-based attention engine, auth) is unchanged. NLP panels still degrade
+gracefully if the NLP upstream becomes unavailable, but the supported
+application topology always routes service traffic through the ESB.
 
 ## PulseWatch AI — one unified multi-agent chatbot
 
@@ -135,8 +135,8 @@ All responses are validated with `chatResponseSchema` before they leave the serv
 
 ### Setup
 
-1. Follow NLP_SETUP.md to run the Python NLP service (`NLP_SERVICE_URL`), and the
-   usual `npm install`, `npm run prisma:migrate`, `npm run dev`.
+1. Follow NLP_SETUP.md to run the required Python NLP + Apache Camel ESB +
+   Next.js stack with `./start.sh`.
 2. Optional: set `GROQ_API_KEY` (and `CHAT_LLM_MODEL`) in `.env` for LLM
    answers; without it the chatbot works in labelled fallback mode.
 3. Open `/chat`. Yahoo Finance article links and publication dates are included
@@ -153,8 +153,10 @@ and FastAPI.
 
 1. Push the project to a GitHub repository and import it into Vercel.
 2. Create a Neon PostgreSQL database and set `DATABASE_URL` in Vercel.
-3. Deploy `render.yaml` from the same repository and copy the Render service
-   URL into Vercel as `NLP_SERVICE_URL`.
+3. Deploy the Python NLP service and Apache Camel ESB in a network where the
+   ESB can reach the NLP service. Set the ESB's `NLP_SERVICE_TARGET_URL` to
+   the Python service URL, then set the ESB's reachable URL in Vercel as
+   `NLP_SERVICE_URL`. Do not point Vercel directly at the Python service.
 4. Set `NEXT_PUBLIC_APP_URL` to the Vercel HTTPS URL.
 5. Set `GROQ_API_KEY` as a secret in Vercel and Render, then run
    `npx prisma migrate deploy` once against the Neon database.
@@ -389,20 +391,23 @@ See ARCHITECTURE.md for details and rationale.
 
 ## Setup instructions
 
-Requires Node.js 20+ and a running PostgreSQL instance.
+Requires Node.js 20+, Python 3.11+, Java 17+, and a running PostgreSQL
+instance.
 
 ```bash
 npm install
 cp .env.example .env    # then edit DATABASE_URL to point at your database
 npx prisma generate
 npx prisma migrate dev  # applies the schema to your database
-./start.sh              # starts Next.js and the Python NLP service
+./start.sh              # starts Python NLP, required Apache Camel ESB, and Next.js
 ```
 
-On the first run, `start.sh` installs missing Node.js/Python dependencies
-and generates the Prisma client. Use `./start.sh --no-nlp` to run only the
-Next.js app. The PostgreSQL database must be running and migrated before
-starting; the launcher does not apply database migrations automatically.
+On the first run, `start.sh` installs missing Node.js/Python dependencies,
+downloads the Maven distribution through the wrapper, and generates the
+Prisma client. Java 17+ is required for the ESB. The PostgreSQL database
+must be running and migrated before starting; the launcher does not apply
+database migrations automatically. The launcher fails if the NLP service
+or ESB does not become ready; there is no direct-to-NLP startup mode.
 
 ## Environment variables
 
@@ -424,11 +429,11 @@ Optional, with defaults (market data / attention):
 | `ATTENTION_CHANGED_PCT` | `0.5` | Minimum % move to classify CHANGED |
 | `ATTENTION_SIGNIFICANT_PCT` | `3` | Minimum % move to classify SIGNIFICANT (must be ≥ `ATTENTION_CHANGED_PCT`) |
 
-Optional, chatbot / NLP (see `.env.example` for comments):
+NLP integration and chatbot (see `.env.example` for comments):
 
 | Variable | Default | Description |
 |---|---|---|
-| `NLP_SERVICE_URL` | `http://localhost:8000` | Python NLP service (run per NLP_SETUP.md) |
+| `NLP_SERVICE_URL` | `http://127.0.0.1:8081` | Required Apache Camel ESB (run per NLP_SETUP.md) |
 | `NLP_SERVICE_TIMEOUT_MS` | `8000` | Timeout per NLP call |
 | `NLP_FEATURE_ENABLED` | `true` | `false` disables all NLP features |
 | `GROQ_API_KEY` | *(unset)* | Enables Groq LLM answers; add a valid key to local `.env`, never commit it |

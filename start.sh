@@ -2,20 +2,43 @@
 set -Eeuo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-NLP_ENABLED=true
 NEXT_PORT="${NEXT_PORT:-3000}"
 NLP_PORT="${NLP_PORT:-8000}"
+ESB_PORT="${ESB_PORT:-8081}"
+
+validate_port() {
+  local name="$1"
+  local value="$2"
+  if [[ ! "$value" =~ ^[0-9]+$ ]] || (( value < 1 || value > 65535 )); then
+    printf 'Error: %s must be a TCP port between 1 and 65535 (got %s).\n' "$name" "$value" >&2
+    exit 2
+  fi
+}
+
+port_is_in_use() {
+  command -v lsof >/dev/null 2>&1 &&
+    lsof -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1
+}
+
+next_available_port() {
+  local port="$1"
+  while port_is_in_use "$port"; do
+    if (( port >= 65535 )); then
+      printf 'Error: no available TCP port found after %s.\n' "$1" >&2
+      exit 1
+    fi
+    port=$((port + 1))
+  done
+  printf '%s' "$port"
+}
 
 usage() {
-  printf 'Usage: %s [--no-nlp]\n' "$0"
-  printf 'Starts the Next.js app and, by default, the Python NLP service.\n'
+  printf 'Usage: %s\n' "$0"
+  printf 'Starts the Python NLP service, required Apache Camel ESB, and Next.js app.\n'
 }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --no-nlp)
-      NLP_ENABLED=false
-      ;;
     -h|--help)
       usage
       exit 0
@@ -30,6 +53,9 @@ while [[ $# -gt 0 ]]; do
 done
 
 cd "$ROOT_DIR"
+validate_port "NEXT_PORT" "$NEXT_PORT"
+validate_port "NLP_PORT" "$NLP_PORT"
+validate_port "ESB_PORT" "$ESB_PORT"
 
 for command_name in node npm curl; do
   if ! command -v "$command_name" >/dev/null 2>&1; then
@@ -53,32 +79,47 @@ if [[ ! -d node_modules ]]; then
   npm ci
 fi
 
-if [[ "$NLP_ENABLED" == true ]]; then
-  PYTHON_CMD=""
-  for candidate in python3 python3.13 python3.12 python3.11; do
-    if command -v "$candidate" >/dev/null 2>&1 &&
-      "$candidate" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)'; then
-      PYTHON_CMD="$candidate"
-      break
-    fi
-  done
-  if [[ -z "$PYTHON_CMD" ]]; then
-    printf 'Error: Python 3.11+ is required to run the NLP service. Use --no-nlp to skip it.\n' >&2
-    exit 1
+PYTHON_CMD=""
+for candidate in python3.13 python3.12 python3.11 python3; do
+  if command -v "$candidate" >/dev/null 2>&1 &&
+    "$candidate" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)'; then
+    PYTHON_CMD="$candidate"
+    break
   fi
+done
+if [[ -z "$PYTHON_CMD" ]]; then
+  printf 'Error: Python 3.11+ is required to run the NLP service and ESB.\n' >&2
+  exit 1
+fi
 
-  NLP_PYTHON="$ROOT_DIR/nlp-service/.venv/bin/python"
-  # Keep this check in sync with the imports performed during app startup.
-  # Existing virtual environments may predate the LangGraph migration.
-  if [[ ! -x "$NLP_PYTHON" ]] || ! "$NLP_PYTHON" -c 'import fastapi, faiss, gensim, sklearn, uvicorn, yfinance, langchain_core, langgraph' >/dev/null 2>&1; then
-    printf 'Preparing Python NLP environment (first run may take several minutes)...\n'
-    "$PYTHON_CMD" -m venv "$ROOT_DIR/nlp-service/.venv"
-    "$NLP_PYTHON" -m pip install -r "$ROOT_DIR/nlp-service/requirements.txt"
-  fi
+NLP_PYTHON="$ROOT_DIR/nlp-service/.venv/bin/python"
+# Keep this check in sync with the imports performed during app startup.
+# Existing virtual environments may predate the LangGraph migration.
+if [[ ! -x "$NLP_PYTHON" ]] || ! "$NLP_PYTHON" -c 'import fastapi, faiss, gensim, sklearn, uvicorn, yfinance, langchain_core, langgraph' >/dev/null 2>&1; then
+  printf 'Preparing Python NLP environment (first run may take several minutes)...\n'
+  "$PYTHON_CMD" -m venv "$ROOT_DIR/nlp-service/.venv"
+  "$NLP_PYTHON" -m pip install -r "$ROOT_DIR/nlp-service/requirements.txt"
+fi
+
+if ! command -v java >/dev/null 2>&1; then
+  printf 'Error: Java 17+ is required to run the Apache Camel ESB.\n' >&2
+  exit 1
+fi
+if [[ ! -f "$ROOT_DIR/esb/mvnw" ]]; then
+  printf 'Error: the required ESB Maven wrapper is missing from esb/.\n' >&2
+  exit 1
+fi
+if ! java -version 2>&1 | grep -Eq 'version "(1[7-9]|[2-9][0-9])'; then
+  printf 'Error: Java 17+ is required to run the Apache Camel ESB.\n' >&2
+  exit 1
+fi
+if ! command -v bash >/dev/null 2>&1; then
+  printf 'Error: bash is required to run the ESB Maven wrapper.\n' >&2
+  exit 1
 fi
 
 printf 'Generating Prisma client...\n'
-node "$ROOT_DIR/node_modules/prisma/build/index.js" generate
+npm exec -- prisma generate
 
 pids=()
 cleanup() {
@@ -96,83 +137,90 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-if [[ "$NLP_ENABLED" == true ]]; then
-  NLP_PID=""
-  # Always replace a listener started by an earlier run. Reusing it can leave
-  # the browser connected to stale Python agent code after an update.
-  if command -v lsof >/dev/null 2>&1; then
-    while IFS= read -r pid; do
-      [[ "$pid" =~ ^[0-9]+$ ]] || continue
-      printf 'Stopping existing NLP service (pid %s) on port %s...\n' "$pid" "$NLP_PORT"
-      kill "$pid" 2>/dev/null || true
-      for _ in {1..20}; do
-        kill -0 "$pid" 2>/dev/null || break
-        sleep 0.1
-      done
-    done < <(lsof -tiTCP:"$NLP_PORT" -sTCP:LISTEN)
-  fi
-  if lsof -nP -iTCP:"$NLP_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
-    printf 'Port %s is occupied; checking the next port for the NLP service.\n' "$NLP_PORT"
-    while lsof -nP -iTCP:"$NLP_PORT" -sTCP:LISTEN >/dev/null 2>&1; do
-      NLP_PORT=$((NLP_PORT + 1))
-    done
-  fi
-  printf 'Starting Python NLP service at http://localhost:%s...\n' "$NLP_PORT"
-  (
-    cd "$ROOT_DIR/nlp-service"
-    exec "$NLP_PYTHON" -m uvicorn app.main:app --host 127.0.0.1 --port "$NLP_PORT"
-  ) &
-  NLP_PID=$!
-  pids+=("$NLP_PID")
+NLP_SERVICE_BASE_URL="http://127.0.0.1:${NLP_PORT}"
+NLP_PORT_REQUESTED="$NLP_PORT"
+NLP_PORT="$(next_available_port "$NLP_PORT")"
+if [[ "$NLP_PORT" != "$NLP_PORT_REQUESTED" ]]; then
+  printf 'NLP port is occupied; using port %s.\n' "$NLP_PORT"
+fi
+printf 'Starting Python NLP service at http://localhost:%s...\n' "$NLP_PORT"
+(
+  cd "$ROOT_DIR/nlp-service"
+  exec "$NLP_PYTHON" -m uvicorn app.main:app --host 127.0.0.1 --port "$NLP_PORT"
+) &
+NLP_PID=$!
+pids+=("$NLP_PID")
 
-  NLP_READY=false
-  for _ in {1..30}; do
-    if curl --silent --fail "http://127.0.0.1:${NLP_PORT}/health" >/dev/null; then
-      NLP_READY=true
-      break
-    fi
-    if ! kill -0 "$NLP_PID" 2>/dev/null; then
-      wait "$NLP_PID" || true
-      printf 'Error: Python NLP service exited before becoming ready.\n' >&2
-      exit 1
-    fi
-    sleep 1
-  done
-  if [[ "$NLP_READY" != true ]]; then
-    printf 'Error: Python NLP service did not become ready at http://localhost:%s.\n' "$NLP_PORT" >&2
+NLP_READY=false
+for _ in {1..30}; do
+  if curl --silent --fail "http://127.0.0.1:${NLP_PORT}/health" >/dev/null; then
+    NLP_READY=true
+    break
+  fi
+  if ! kill -0 "$NLP_PID" 2>/dev/null; then
+    wait "$NLP_PID" || true
+    printf 'Error: Python NLP service exited before becoming ready.\n' >&2
     exit 1
   fi
+  sleep 1
+done
+if [[ "$NLP_READY" != true ]]; then
+  printf 'Error: Python NLP service did not become ready at http://localhost:%s.\n' "$NLP_PORT" >&2
+  exit 1
 fi
 
-printf 'Starting PulseWatch on port %s...\n' "$NEXT_PORT"
-# Development chunks are content-addressed. Remove a previous dev build so
-# an interrupted/restarted server cannot leave the browser with stale assets.
-if command -v lsof >/dev/null 2>&1; then
-  while IFS= read -r pid; do
-    [[ "$pid" =~ ^[0-9]+$ ]] || continue
-    printf 'Stopping existing Next.js process (pid %s) on port %s...\n' "$pid" "$NEXT_PORT"
-    kill "$pid" 2>/dev/null || true
-    for _ in {1..20}; do
-      kill -0 "$pid" 2>/dev/null || break
-      sleep 0.1
-    done
-  done < <(lsof -tiTCP:"$NEXT_PORT" -sTCP:LISTEN)
+ESB_PORT_REQUESTED="$ESB_PORT"
+ESB_PORT="$(next_available_port "$ESB_PORT")"
+if [[ "$ESB_PORT" != "$ESB_PORT_REQUESTED" ]]; then
+  printf 'ESB port is occupied; using port %s.\n' "$ESB_PORT"
 fi
-rm -rf "$ROOT_DIR/.next"
-NLP_SERVICE_URL="http://127.0.0.1:${NLP_PORT}" npm run dev -- --hostname 127.0.0.1 --port "$NEXT_PORT" &
+printf 'Starting required Apache Camel ESB at http://localhost:%s...\n' "$ESB_PORT"
+(
+  cd "$ROOT_DIR/esb"
+  export NLP_SERVICE_TARGET_URL="http://127.0.0.1:${NLP_PORT}"
+  export ESB_PORT
+  exec bash ./mvnw spring-boot:run
+) &
+ESB_PID=$!
+pids+=("$ESB_PID")
+
+ESB_READY=false
+for _ in {1..90}; do
+  if curl --silent --fail --max-time 5 \
+    "http://127.0.0.1:${ESB_PORT}/ready" >/dev/null; then
+    ESB_READY=true
+    break
+  fi
+  if ! kill -0 "$ESB_PID" 2>/dev/null; then
+    wait "$ESB_PID" || true
+    printf 'Error: Apache Camel ESB exited before becoming ready.\n' >&2
+    exit 1
+  fi
+  sleep 1
+done
+if [[ "$ESB_READY" != true ]]; then
+  printf 'Error: Apache Camel ESB did not become ready at http://localhost:%s.\n' "$ESB_PORT" >&2
+  exit 1
+fi
+NLP_SERVICE_BASE_URL="http://127.0.0.1:${ESB_PORT}"
+
+printf 'Starting PulseWatch on port %s...\n' "$NEXT_PORT"
+NEXT_PORT="$(next_available_port "$NEXT_PORT")"
+NLP_SERVICE_URL="$NLP_SERVICE_BASE_URL" npm run dev -- --hostname 127.0.0.1 --port "$NEXT_PORT" &
 NEXT_PID=$!
 pids+=("$NEXT_PID")
 
 NEXT_READY=false
 for _ in {1..60}; do
-  # Warm the protected app page, not only "/" (which redirects to /login
-  # without a session). This compiles the page chunk before a real browser
-  # request can reference it.
-  if curl --silent --fail \
+  # Warm the protected dashboard and public login route. The dashboard warm-up
+  # compiles app/page.js before a browser can receive a document referencing it.
+  if curl --silent --show-error --fail --max-time 5 \
     -H 'Cookie: pw_session=startup-warmup' \
     "http://127.0.0.1:${NEXT_PORT}/" >/dev/null &&
-    curl --silent --fail \
-    "http://127.0.0.1:${NEXT_PORT}/_next/static/chunks/app/page.js" >/dev/null; then
+    curl --silent --show-error --fail --max-time 5 \
+    "http://127.0.0.1:${NEXT_PORT}/login" >/dev/null &&
+    curl --silent --show-error --fail --max-time 5 \
+    "http://127.0.0.1:${NEXT_PORT}/chat" >/dev/null; then
     NEXT_READY=true
     break
   fi
@@ -190,16 +238,20 @@ fi
 
 printf '\nPulseWatch is ready. Open these links:\n'
 printf '  App:       http://localhost:%s/\n' "$NEXT_PORT"
-if [[ "$NLP_ENABLED" == true ]]; then
-  printf '  NLP docs:  http://localhost:%s/docs\n' "$NLP_PORT"
-  printf '  NLP health: http://localhost:%s/health\n' "$NLP_PORT"
-fi
+printf '  ESB health: http://localhost:%s/health\n' "$ESB_PORT"
+printf '  ESB ready:  http://localhost:%s/ready\n' "$ESB_PORT"
+printf '  NLP docs:   http://localhost:%s/docs\n' "$ESB_PORT"
 printf 'Press Ctrl+C to stop the services.\n\n'
 
 while kill -0 "$NEXT_PID" 2>/dev/null; do
-  if [[ "$NLP_ENABLED" == true && -n "$NLP_PID" ]] && ! kill -0 "$NLP_PID" 2>/dev/null; then
+  if ! kill -0 "$NLP_PID" 2>/dev/null; then
     wait "$NLP_PID" || true
     printf 'Error: Python NLP service stopped unexpectedly.\n' >&2
+    exit 1
+  fi
+  if ! kill -0 "$ESB_PID" 2>/dev/null; then
+    wait "$ESB_PID" || true
+    printf 'Error: Apache Camel ESB stopped unexpectedly.\n' >&2
     exit 1
   fi
   sleep 1

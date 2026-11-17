@@ -55,19 +55,17 @@ const envSchema = z.object({
   STALE_DISPLAY_ROUNDING_MINUTES: z.coerce.number().int().positive().default(1),
 
   // --- NLP intelligence --------------------------------------------------
-  // Base URL of the standalone Python NLP service (see /nlp-service).
-  // Defaults to the service's local dev port so `npm run dev` +
-  // `uvicorn app.main:app` work together with zero extra config.
-  NLP_SERVICE_URL: z.string().url().default("http://localhost:8000"),
+  // Base URL of the required Apache Camel ESB, which forwards to the
+  // Python NLP service (see /esb and /nlp-service).
+  NLP_SERVICE_URL: z.string().url().default("http://127.0.0.1:8081"),
   // How long to wait for the NLP service before treating this request as
   // unavailable and falling back gracefully (see server/modules/nlp/client.ts).
   // NLP calls can be slower than market-data calls (LDA/embeddings aren't
   // free), hence a higher default than MARKET_DATA_TIMEOUT_MS.
-  NLP_SERVICE_TIMEOUT_MS: z.coerce.number().int().positive().default(8000),
-  // If "true", NLP intelligence sections are hidden/disabled app-wide
-  // instead of attempting to reach the NLP service at all — useful for
-  // running PulseWatch's core market-watchlist functionality with zero
-  // Python dependency, per the project's "NLP must be optional" rule.
+  NLP_SERVICE_TIMEOUT_MS: z.coerce.number().int().positive().default(30000),
+  // If "false", NLP intelligence sections are hidden/disabled app-wide
+  // instead of attempting to reach the NLP service. This does not change
+  // the required ESB integration topology.
   NLP_FEATURE_ENABLED: z
     .enum(["true", "false"])
     .default("true")

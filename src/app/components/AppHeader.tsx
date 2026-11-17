@@ -132,12 +132,6 @@ export default function AppHeader() {
           >
             PulseWatch AI
           </Link>
-          <Link
-            href="/nlp-demo"
-            className={`app-nav-link ${pathname?.startsWith("/nlp-demo") ? "is-active" : ""}`}
-          >
-            NLP Demo
-          </Link>
         </nav>
 
         <div className="app-header-right">

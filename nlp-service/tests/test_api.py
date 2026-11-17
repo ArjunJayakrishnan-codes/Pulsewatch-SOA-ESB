@@ -79,8 +79,8 @@ def test_market_history_endpoint_returns_bars(client, monkeypatch):
 def test_text_endpoints_never_500_on_degenerate_input(client, text):
     """Every text-accepting endpoint must degrade gracefully (2xx with an
     empty/fallback result), never raise an unhandled 500, on short or
-    degenerate pasted text — this is exactly the kind of input the
-    /nlp-demo page's free-text box invites."""
+    degenerate pasted text, which should be handled gracefully by every
+    text-analysis endpoint."""
     endpoints = [
         "/nlp/analyze", "/nlp/preprocess", "/nlp/sentiment", "/nlp/entities",
         "/nlp/classify", "/nlp/aspects", "/nlp/events", "/nlp/summarize",

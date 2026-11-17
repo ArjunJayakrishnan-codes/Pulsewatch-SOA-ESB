@@ -27,6 +27,7 @@ describe("getEnv", () => {
     const env = getEnv();
     expect(env.DATABASE_URL).toBe("postgresql://user:pass@localhost:5432/db");
     expect(env.NEXT_PUBLIC_APP_URL).toBe("http://localhost:3000");
+    expect(env.NLP_SERVICE_URL).toBe("http://127.0.0.1:8081");
     expect(env.MARKET_DATA_PROVIDER).toBe("yfinance");
     expect(env.CHAT_LLM_MODEL).toBe("llama-3.3-70b-versatile");
   });

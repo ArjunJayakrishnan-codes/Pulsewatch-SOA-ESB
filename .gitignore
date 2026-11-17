@@ -12,3 +12,6 @@ nlp-service/__pycache__/
 nlp-service/**/__pycache__/
 nlp-service/.pytest_cache/
 .neon
+
+# Apache Camel ESB build output
+esb/target/
